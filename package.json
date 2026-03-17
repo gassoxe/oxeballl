@@ -1,0 +1,16 @@
+{
+  "name": "oxeball",
+  "version": "1.0.0",
+  "description": "OXE Ball — Crypto Plinko Game",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js"
+  },
+  "engines": {
+    "node": ">=14.0.0"
+  },
+  "keywords": ["game", "plinko", "crypto", "bnb"],
+  "author": "OXE BALL",
+  "license": "MIT"
+}
