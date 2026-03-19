@@ -1,695 +1,668 @@
-const http = require('http');
-const fs   = require('fs');
-const path = require('path');
+'use strict';
+/**
+ * server.js — OXE BALL  ·  Auth + Game Backend
+ *
+ * Structure expected on disk:
+ *   server.js        ← this file
+ *   db.js            ← database helpers
+ *   auth.js          ← JWT + password
+ *   email.js         ← email sending
+ *   google.js        ← Google token verification
+ *   referral.js      ← referral system
+ *   public/
+ *     index.html     ← game + auth UI
+ *     admin.html     ← admin panel
+ *     admin-new.html ← alternative admin
+ *     auth.html      ← standalone auth page
+ *     api.js         ← client-side API helper
+ *     auth.js        ← client-side auth logic
+ *     auth.css       ← auth page styles
+ *   data/            ← auto-created, JSON files
+ *
+ * Routes:
+ *   GET  /                        → public/index.html
+ *   GET  /admin                   → public/admin.html
+ *   GET  /auth                    → public/auth.html
+ *   GET  /health                  → "OK"
+ *   GET  /api/config              → public game config
+ *   POST /api/auth/send-code      → send 6-digit email code
+ *   POST /api/auth/verify-code    → verify code → JWT
+ *   POST /api/auth/resend-code    → resend code
+ *   POST /api/auth/login          → email + password login
+ *   POST /api/auth/forgot-password→ send reset link
+ *   POST /api/auth/reset-password → consume token, set new password
+ *   POST /api/auth/google         → Google OAuth login
+ *   GET  /api/me                  → my profile [auth]
+ *   POST /api/me/balance          → sync balance [auth]
+ *   GET  /api/referral            → my referral code [auth]
+ *   POST /api/withdraw            → request withdrawal [auth]
+ *   POST /api/deposit/verify      → verify deposit TX [auth]
+ *   POST /api/admin/login         → admin login
+ *   GET  /api/admin/users         → all users [admin]
+ *   POST /api/admin/users/ban     → ban/unban [admin]
+ *   DELETE /api/admin/users/:uid  → delete user [admin]
+ *   GET  /api/admin/config        → game config [admin]
+ *   POST /api/admin/config        → save config [admin]
+ *   GET  /api/admin/withdrawals   → withdrawal list [admin]
+ *   POST /api/admin/withdrawals/update → update status [admin]
+ *   GET  /api/admin/deposits      → deposit log [admin]
+ *   GET  /api/admin/referrals     → referral list [admin]
+ *   GET  /api/admin/deleted       → deleted users [admin]
+ */
+
+const http   = require('http');
+const fs     = require('fs');
+const path   = require('path');
 const crypto = require('crypto');
 
-// ─── DATA FILES ───────────────────────────────────────────────────────────────
-const DATA_DIR = path.join(__dirname, 'data');
-if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR);
+// ── Local modules (all in root, same folder as server.js) ─────────────────────
+const db       = require('./db');
+const Auth     = require('./auth');
+const Email    = require('./email');
+const Google   = require('./google');
+const Referral = require('./referral');
 
-function dbPath(name) { return path.join(DATA_DIR, name + '.json'); }
+// ── Constants ──────────────────────────────────────────────────────────────────
+const PORT     = process.env.PORT     || 3000;
+const HOST     = '0.0.0.0';                        // required for Railway
+const PUB      = path.join(__dirname, 'public');    // frontend files live here
+const ADMIN_PW = process.env.ADMIN_PASSWORD || 'oxeball2024';
 
-function readDB(name) {
-  try { return JSON.parse(fs.readFileSync(dbPath(name), 'utf8')); }
-  catch(e) { return {}; }
-}
+// In-memory password reset tokens: { token → { email, exp } }
+const resetTokens = {};
 
-function writeDB(name, data) {
-  fs.writeFileSync(dbPath(name), JSON.stringify(data, null, 2));
-}
+// ── HTTP helpers ───────────────────────────────────────────────────────────────
+const CORS = {
+  'Access-Control-Allow-Origin':  '*',
+  'Access-Control-Allow-Methods': 'GET,POST,DELETE,OPTIONS',
+  'Access-Control-Allow-Headers': 'Content-Type,Authorization'
+};
 
-// Initialize default config if missing
-if (!readDB('config').rate) {
-  writeDB('config', {
-    rate: 20, minBet: 10, maxBet: 100000,
-    winPct: 10, trialOxe: 200, adminPw: 'oxeball2024'
-  });
-}
-if (!readDB('users').list) writeDB('users', { list: {} });
-if (!readDB('refs').list)  writeDB('refs',  { list: {} });
-if (!readDB('txlog').deposits) writeDB('txlog', { deposits: [], withdrawals: [], deletedUsers: [], referrals: [] });
-
-// ─── HELPERS ──────────────────────────────────────────────────────────────────
-function hash(str) { return crypto.createHash('sha256').update(str).digest('hex'); }
-
-function readBody(req) {
-  return new Promise((res) => {
-    let body = '';
-    req.on('data', c => body += c);
-    req.on('end', () => {
-      try { res(JSON.parse(body)); } catch(e) { res({}); }
-    });
-  });
-}
-
-function json(res, data, status=200) {
-  res.writeHead(status, {
-    'Content-Type': 'application/json',
-    'Access-Control-Allow-Origin': '*',
-    'Access-Control-Allow-Methods': 'GET,POST,DELETE,OPTIONS',
-    'Access-Control-Allow-Headers': 'Content-Type,Authorization'
-  });
+function json(res, data, status) {
+  status = status || 200;
+  res.writeHead(status, { 'Content-Type': 'application/json', ...CORS });
   res.end(JSON.stringify(data));
 }
 
-function serveFile(res, filePath, extraHeaders={}) {
-  const ext = path.extname(filePath).toLowerCase();
-  const types = {
-    '.html': 'text/html; charset=utf-8',
-    '.js':   'application/javascript; charset=utf-8',
-    '.css':  'text/css',
-    '.json': 'application/json',
-    '.png':  'image/png',
-    '.ico':  'image/x-icon',
-    '.txt':  'text/plain'
-  };
+// MIME type map for static files
+const MIME = {
+  '.html': 'text/html; charset=utf-8',
+  '.js':   'application/javascript; charset=utf-8',
+  '.css':  'text/css; charset=utf-8',
+  '.json': 'application/json',
+  '.ico':  'image/x-icon',
+  '.png':  'image/png',
+  '.jpg':  'image/jpeg',
+  '.svg':  'image/svg+xml',
+  '.txt':  'text/plain'
+};
+
+/**
+ * Serve a static file from disk.
+ * Returns 404 HTML if the file does not exist.
+ */
+function serveFile(res, filePath) {
+  // Security: only serve files inside /public
+  const resolved = path.resolve(filePath);
+  if (!resolved.startsWith(PUB)) {
+    res.writeHead(403, { 'Content-Type': 'text/plain', ...CORS });
+    return res.end('Forbidden');
+  }
   try {
-    const data = fs.readFileSync(filePath);
-    res.writeHead(200, {
-      'Content-Type': types[ext] || 'application/octet-stream',
-      ...extraHeaders
-    });
+    const data = fs.readFileSync(resolved);
+    const ext  = path.extname(resolved).toLowerCase();
+    res.writeHead(200, { 'Content-Type': MIME[ext] || 'application/octet-stream', ...CORS });
     res.end(data);
-  } catch(e) {
-    res.writeHead(404, { 'Content-Type': 'text/html', ...extraHeaders });
-    res.end(`<!DOCTYPE html><html><body style="font-family:sans-serif;padding:40px;background:#03030b;color:#00d4ff">
-      <h2>⬡ OXE BALL</h2><p style="color:#ff5533">Page not found: ${filePath}</p>
-      <a href="/" style="color:#9933ff">← Back to game</a></body></html>`);
+  } catch {
+    res.writeHead(404, { 'Content-Type': 'text/html', ...CORS });
+    res.end('<!DOCTYPE html><html><body style="font-family:sans-serif;padding:40px;background:#03030b;color:#ff5533"><h2>404 — Not Found</h2><p><a href="/" style="color:#9933ff">← Home</a></p></body></html>');
   }
 }
 
-// Simple token store (in-memory, resets on server restart — use Redis in prod)
-const sessions = {};
-function genToken() { return crypto.randomBytes(32).toString('hex'); }
-
-// Pending email verifications {email: {code, username, password, refCode, expiresAt}}
-const pending = {};
-function genCode() { return String(Math.floor(100000 + Math.random() * 900000)); }
-
-// ── EMAIL SENDER ──────────────────────────────────────────────────────────────
-// Uses Node.js built-in net/tls — no npm packages needed
-// Configure via environment variables or data/email-config.json
-function getEmailConfig() {
-  try {
-    const cfg = JSON.parse(require('fs').readFileSync(
-      require('path').join(__dirname, 'data', 'email-config.json'), 'utf8'
-    ));
-    return cfg;
-  } catch(e) {
-    return {
-      host: process.env.SMTP_HOST || 'smtp.gmail.com',
-      port: parseInt(process.env.SMTP_PORT) || 587,
-      user: process.env.SMTP_USER || '',
-      pass: process.env.SMTP_PASS || '',
-      from: process.env.SMTP_FROM || process.env.SMTP_USER || 'oxeball@gmail.com'
-    };
-  }
-}
-
-async function sendEmail(to, subject, html) {
-  const cfg = getEmailConfig();
-  if (!cfg.user || !cfg.pass) {
-    // Dev mode — log to console instead of sending
-    console.log('\n📧 [EMAIL SIMULATION — configure SMTP to send real emails]');
-    console.log('  To:', to);
-    console.log('  Subject:', subject);
-    console.log('  Body snippet:', html.replace(/<[^>]+>/g,'').trim().slice(0,100));
-    console.log('');
-    return true;
-  }
-  return new Promise((resolve) => {
-    const tls = require('tls');
-    const net = require('net');
-
-    const b64 = (s) => Buffer.from(s).toString('base64');
-    const crlf = '\r\n';
-
-    const body = [
-      'From: OXE BALL <' + cfg.from + '>',
-      'To: ' + to,
-      'Subject: ' + subject,
-      'MIME-Version: 1.0',
-      'Content-Type: text/html; charset=UTF-8',
-      '',
-      html
-    ].join(crlf);
-
-    let sock;
-    let step = 0;
-    const steps = [
-      () => sock.write('EHLO oxeball' + crlf),
-      () => sock.write('AUTH LOGIN' + crlf),
-      () => sock.write(b64(cfg.user) + crlf),
-      () => sock.write(b64(cfg.pass) + crlf),
-      () => sock.write('MAIL FROM:<' + cfg.from + '>' + crlf),
-      () => sock.write('RCPT TO:<' + to + '>' + crlf),
-      () => sock.write('DATA' + crlf),
-      () => sock.write(body + crlf + '.' + crlf),
-      () => sock.write('QUIT' + crlf),
-    ];
-
-    function next(data) {
-      if (data && (data.includes('535') || data.includes('550') || data.includes('554'))) {
-        console.error('SMTP error:', data.trim());
-        sock.destroy(); resolve(false); return;
-      }
-      if (step < steps.length) { steps[step++](); }
-      else { sock.destroy(); resolve(true); }
-    }
-
-    if (cfg.port === 465) {
-      sock = tls.connect({ host: cfg.host, port: cfg.port }, () => next());
-    } else {
-      sock = net.connect({ host: cfg.host, port: cfg.port });
-      sock.once('data', () => {
-        sock.write('STARTTLS' + crlf);
-        sock.once('data', (d) => {
-          if (d.toString().includes('220')) {
-            const upgraded = tls.connect({ socket: sock, host: cfg.host }, () => {
-              sock = upgraded;
-              sock.on('data', d => next(d.toString()));
-              next();
-            });
-          } else { next(); }
-        });
-      });
-    }
-
-    if (cfg.port !== 465) {
-      sock.on('data', d => next(d.toString()));
-    }
-    sock.on('error', (e) => { console.error('SMTP sock error:', e.message); resolve(false); });
-    setTimeout(() => { try { sock.destroy(); } catch(e){} resolve(false); }, 15000);
+/**
+ * Read and parse JSON request body.
+ * Returns {} on parse error or empty body.
+ */
+function readBody(req) {
+  return new Promise(resolve => {
+    let buf = '';
+    req.on('data', chunk => {
+      buf += chunk;
+      if (buf.length > 200_000) req.destroy(); // prevent abuse
+    });
+    req.on('end',   () => { try { resolve(JSON.parse(buf)); } catch { resolve({}); } });
+    req.on('error', () => resolve({}));
   });
 }
-function authCheck(req) {
-  const auth = req.headers['authorization'] || '';
-  const token = auth.replace('Bearer ', '');
-  return sessions[token] || null;
-}
-function isAdmin(req) {
-  const sess = authCheck(req);
-  return sess && sess.role === 'admin';
+
+// ── Auth helpers ───────────────────────────────────────────────────────────────
+
+/** Parse Bearer token from Authorization header. Returns JWT payload or null. */
+function getSession(req) {
+  const h = req.headers['authorization'] || '';
+  if (!h.startsWith('Bearer ')) return null;
+  return Auth.verifyJWT(h.slice(7));
 }
 
-// ─── ROUTER ───────────────────────────────────────────────────────────────────
-const PORT = process.env.PORT || 3000;
-const HOST = '0.0.0.0'; // required for Railway, Render, Glitch
-
-http.createServer(async (req, res) => {
-  // CORS — allow all origins
-  const corsHeaders = {
-    'Access-Control-Allow-Origin': '*',
-    'Access-Control-Allow-Methods': 'GET,POST,DELETE,OPTIONS',
-    'Access-Control-Allow-Headers': 'Content-Type,Authorization'
+/** Build a login API response from a user object + new JWT. */
+function loginResponse(user) {
+  return {
+    token:        Auth.signJWT({ uid: user.uid, email: user.email, username: user.username, role: 'player' }),
+    uid:          user.uid,
+    email:        user.email        || null,
+    username:     user.username     || null,
+    method:       user.method,
+    balance:      user.balance      || 0,
+    gamesPlayed:  user.gamesPlayed  || 0
   };
+}
 
+// ── User DB helpers ────────────────────────────────────────────────────────────
+
+function getUsers() {
+  const u = db.read('users') || {};
+  // Migrate old {list:{}} format automatically
+  if (u.list && !u.byEmail) {
+    const m = { byEmail: {} };
+    Object.values(u.list).forEach(usr => { if (usr.email) m.byEmail[usr.email.toLowerCase()] = usr; });
+    db.write('users', m);
+    return m;
+  }
+  if (!u.byEmail) u.byEmail = {};
+  return u;
+}
+
+function getUserByEmail(email) {
+  if (!email) return null;
+  return getUsers().byEmail[email.toLowerCase()] || null;
+}
+
+function getUserByUid(uid) {
+  const users = getUsers();
+  return Object.values(users.byEmail).find(u => u.uid === uid) || null;
+}
+
+function saveUser(user) {
+  const users = getUsers();
+  if (user.email) users.byEmail[user.email.toLowerCase()] = user;
+  db.write('users', users);
+}
+
+function createUser({ email, username, pwHash, method, refCode, googleId }) {
+  const uid   = Auth.newUid(method === 'google' ? 'G' : 'E');
+  const now   = new Date().toISOString();
+  const code  = Referral.registerCode(uid, email);
+  const bonus = Referral.processReferral(uid, refCode);
+  const user  = {
+    uid,
+    email:         email ? email.toLowerCase() : null,
+    username:      username  || null,
+    pwHash:        pwHash    || null,
+    method:        method,
+    googleId:      googleId  || null,
+    balance:       bonus,
+    gamesPlayed:   0,
+    totalDeposits: 0,
+    registeredAt:  now,
+    lastLogin:     now,
+    banned:        false,
+    emailVerified: method !== 'email',
+    referralCode:  code,
+    referredBy:    refCode || null
+  };
+  saveUser(user);
+  return user;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  HTTP SERVER
+// ═══════════════════════════════════════════════════════════════════════════════
+http.createServer(async (req, res) => {
+
+  // Handle CORS preflight
   if (req.method === 'OPTIONS') {
-    res.writeHead(204, corsHeaders);
+    res.writeHead(204, CORS);
     return res.end();
   }
 
-  // Strip query string and trailing slash for routing
-  const rawUrl = req.url || '/';
-  const url = rawUrl.split('?')[0].replace(/\/+$/, '') || '/';
+  // Strip query string and trailing slashes for clean routing
+  const url    = (req.url || '/').split('?')[0].replace(/\/+$/, '') || '/';
   const method = req.method;
 
-  // ── HEALTH CHECK (required by Railway / Render) ──
+  // ── Health check (Railway requires this) ────────────────────────────────────
   if (url === '/health' || url === '/ping') {
-    res.writeHead(200, { 'Content-Type': 'text/plain', ...corsHeaders });
+    res.writeHead(200, { 'Content-Type': 'text/plain', ...CORS });
     return res.end('OK');
   }
 
-  // ── STATIC FILES ──
-  if (method === 'GET') {
-    if (url === '/' || url === '/index.html' || url === '/game' || url === '/game.html') {
-      return serveFile(res, path.join(__dirname, 'public', 'game.html'), corsHeaders);
-    }
-    if (url === '/admin' || url === '/admin.html') {
-      return serveFile(res, path.join(__dirname, 'public', 'admin.html'), corsHeaders);
-    }
-    // Serve any file from /public (api.js, etc.)
-    if (!url.startsWith('/api/') && url !== '/api') {
-      const filePath = path.join(__dirname, 'public', url.slice(1) || 'game.html');
-      // Security: prevent path traversal
-      if (!filePath.startsWith(path.join(__dirname, 'public'))) {
-        res.writeHead(403); return res.end('Forbidden');
-      }
-      return serveFile(res, filePath, corsHeaders);
-    }
+  // ── Static file serving ──────────────────────────────────────────────────────
+  // Only serve GET requests that don't start with /api
+  if (method === 'GET' && !url.startsWith('/api/') && url !== '/api') {
+
+    // Named routes → specific HTML files
+    if (url === '/' || url === '/index.html' || url === '/game')
+      return serveFile(res, path.join(PUB, 'index.html'));
+
+    if (url === '/admin' || url === '/admin.html')
+      return serveFile(res, path.join(PUB, 'admin.html'));
+
+    if (url === '/auth' || url === '/auth.html')
+      return serveFile(res, path.join(PUB, 'auth.html'));
+
+    // Any other static asset (js, css, images, etc.)
+    // url.slice(1) turns '/api.js' → 'api.js'
+    return serveFile(res, path.join(PUB, url.slice(1)));
   }
 
-  // ─────────────────────────────────────────────────────────────────────────
-  //  API ROUTES
-  // ─────────────────────────────────────────────────────────────────────────
+  // ═══════════════════════════════════════════════════════════════════════════
+  //  PUBLIC API
+  // ═══════════════════════════════════════════════════════════════════════════
 
-  // ── CONFIG (public read) ──
+  // GET /api/config — returns public game settings + Google client ID
   if (method === 'GET' && url === '/api/config') {
-    const cfg = readDB('config');
-    return json(res, { rate: cfg.rate, minBet: cfg.minBet, maxBet: cfg.maxBet,
-                       winPct: cfg.winPct, trialOxe: cfg.trialOxe });
-  }
-
-  // ── AUTH: send verification code to Gmail ──
-  if (method === 'POST' && url === '/api/auth/send-code') {
-    const body = await readBody(req);
-    const { email, username, password, refCode } = body;
-    if (!email || !username || !password)
-      return json(res, { error: 'Missing fields' }, 400);
-    if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email))
-      return json(res, { error: 'Invalid email address' }, 400);
-    if (password.length < 6)
-      return json(res, { error: 'Password must be at least 6 characters' }, 400);
-    if (username.length < 3)
-      return json(res, { error: 'Username must be at least 3 characters' }, 400);
-    // Check not already registered
-    const users = readDB('users');
-    if (users.list[email])
-      return json(res, { error: 'Email already registered' }, 409);
-    // Generate & store code (expires in 10 min)
-    const code = genCode();
-    pending[email] = {
-      code, username, password: hash(password), refCode: refCode || null,
-      expiresAt: Date.now() + 10 * 60 * 1000
-    };
-    // Send email
-    const emailHtml = `
-      <!DOCTYPE html><html><body style="margin:0;padding:0;background:#07070f;font-family:'Segoe UI',sans-serif;">
-      <div style="max-width:480px;margin:0 auto;padding:32px 24px;">
-        <div style="text-align:center;margin-bottom:24px;">
-          <h1 style="color:#00d4ff;font-size:28px;letter-spacing:4px;margin:0;">OXE<span style="color:#cc44ff;">●</span>BALL</h1>
-          <p style="color:#3344aa;font-size:11px;letter-spacing:2px;margin:4px 0 0;">CRYPTO PLINKO</p>
-        </div>
-        <div style="background:#0a0a1e;border:1px solid #2a2a55;border-radius:16px;padding:28px;">
-          <p style="color:#aabbcc;font-size:15px;margin:0 0 8px;">Hi <b style="color:#fff;">\${username}</b>,</p>
-          <p style="color:#6677aa;font-size:13px;margin:0 0 24px;">Your verification code for OXE BALL:</p>
-          <div style="background:#04040e;border:2px solid #9933ff;border-radius:12px;padding:20px;text-align:center;margin:0 0 24px;">
-            <div style="font-size:40px;font-weight:900;letter-spacing:10px;color:#cc44ff;font-family:'Courier New',monospace;">\${code}</div>
-            <div style="color:#3344aa;font-size:11px;margin-top:8px;">Expires in 10 minutes</div>
-          </div>
-          <p style="color:#6677aa;font-size:12px;margin:0;">If you didn't request this, ignore this email.</p>
-        </div>
-        <p style="color:#1a1a44;font-size:10px;text-align:center;margin:20px 0 0;">© OXE BALL · Do not reply to this email</p>
-      </div></body></html>
-    `;
-    const cfg2 = getEmailConfig();
-    const sent = await sendEmail(email, 'Your OXE BALL Verification Code: ' + code, emailHtml);
-    if (!cfg2.user) {
-      // Dev mode — return code directly so frontend can show it
-      return json(res, { success: true, devCode: code, message: 'Dev mode: code shown below' });
-    }
-    if (sent) {
-      return json(res, { success: true, message: 'Verification code sent to ' + email });
-    } else {
-      return json(res, { error: 'Failed to send email. Check SMTP config in data/email-config.json' }, 500);
-    }
-  }
-
-  // ── AUTH: verify code & complete registration ──
-  if (method === 'POST' && url === '/api/auth/verify-code') {
-    const body = await readBody(req);
-    const { email, code } = body;
-    const p = pending[email];
-    if (!p) return json(res, { error: 'No pending verification for this email' }, 400);
-    if (Date.now() > p.expiresAt) {
-      delete pending[email];
-      return json(res, { error: 'Code expired. Please register again.' }, 400);
-    }
-    if (p.code !== String(code).trim())
-      return json(res, { error: 'Incorrect code. Try again.' }, 400);
-    // Code correct — create user
-    const users = readDB('users');
-    if (users.list[email]) {
-      delete pending[email];
-      return json(res, { error: 'Email already registered' }, 409);
-    }
-    const uid = 'E' + Date.now();
-    const now = new Date().toISOString();
-    const refs = readDB('refs');
-    let bonus = 0;
-    if (p.refCode && refs.list[p.refCode]) {
-      bonus = readDB('config').trialOxe || 200;
-    }
-    users.list[email] = {
-      uid, email, username: p.username, pwHash: p.password,
-      method: 'email', balance: bonus, gamesPlayed: 0,
-      totalDeposits: 0, registeredAt: now, lastLogin: now,
-      banned: false, emailVerified: true, referredBy: p.refCode || null
-    };
-    writeDB('users', users);
-    // Referral code
-    const myCode = ('OXE' + uid).toUpperCase().slice(0, 8);
-    refs.list[myCode] = { uid, count: 0, earned: 0, referrals: [] };
-    // Process referrer reward
-    if (p.refCode && refs.list[p.refCode]) {
-      const r = refs.list[p.refCode];
-      if (!r.referrals.includes(uid)) {
-        r.count++; r.earned += 15; r.referrals.push(uid);
-        const referrer = Object.values(users.list).find(u => u.uid === r.uid);
-        if (referrer) { referrer.balance = (referrer.balance || 0) + 15; writeDB('users', users); }
-      }
-    }
-    writeDB('refs', refs);
-    delete pending[email];
-    const token = genToken();
-    sessions[token] = { uid, email, username: p.username, role: 'player' };
-    return json(res, { token, uid, email, username: p.username, balance: bonus, isNew: true });
-  }
-
-  // ── AUTH: resend verification code ──
-  if (method === 'POST' && url === '/api/auth/resend-code') {
-    const body = await readBody(req);
-    const { email } = body;
-    const p = pending[email];
-    if (!p) return json(res, { error: 'No pending registration for this email' }, 400);
-    // Refresh code
-    p.code = genCode();
-    p.expiresAt = Date.now() + 10 * 60 * 1000;
-    const emailHtml = `<div style="font-family:sans-serif;padding:20px;background:#07070f;">
-      <h2 style="color:#00d4ff;">OXE BALL — New Code</h2>
-      <p style="color:#aaa;">Hi \${p.username}, your new code:</p>
-      <div style="font-size:36px;font-weight:900;letter-spacing:10px;color:#cc44ff;padding:20px;background:#04040e;border:2px solid #9933ff;border-radius:12px;text-align:center;">\${p.code}</div>
-      <p style="color:#666;">Expires in 10 minutes.</p></div>`;
-    await sendEmail(email, 'OXE BALL — New Code: ' + p.code, emailHtml);
-    const cfg = getEmailConfig();
-    return json(res, { success: true, ...((!cfg.user) ? { devCode: p.code } : {}) });
-  }
-
-  // ── AUTH: register with email ──
-  if (method === 'POST' && url === '/api/auth/register') {
-    const body = await readBody(req);
-    const { email, password, username, refCode } = body;
-    if (!email || !password || !username)
-      return json(res, { error: 'Missing fields' }, 400);
-    const users = readDB('users');
-    if (users.list[email])
-      return json(res, { error: 'Email already registered' }, 409);
-    const uid = 'E' + Date.now();
-    const now = new Date().toISOString();
-    const refs = readDB('refs');
-    let bonus = 0;
-    if (refCode && refs.list[refCode]) bonus = 200; // trialOxe default
-    users.list[email] = {
-      uid, email, username, pwHash: hash(password),
-      method: 'email', balance: bonus, gamesPlayed: 0,
-      totalDeposits: 0, registeredAt: now, lastLogin: now,
-      banned: false, referredBy: refCode || null
-    };
-    writeDB('users', users);
-    // Set up referral code
-    const myCode = ('OXE' + uid).toUpperCase().slice(0, 8);
-    refs.list[myCode] = { uid, count: 0, earned: 0, referrals: [] };
-    writeDB('refs', refs);
-    // Process referral reward
-    if (refCode && refs.list[refCode]) {
-      const r = refs.list[refCode];
-      if (!r.referrals.includes(uid)) {
-        r.count++; r.earned += 15; r.referrals.push(uid);
-        const referrer = Object.values(users.list).find(u => u.uid === r.uid);
-        if (referrer) referrer.balance = (referrer.balance || 0) + 15;
-        writeDB('refs', refs); writeDB('users', users);
-      }
-    }
-    const token = genToken();
-    sessions[token] = { uid, email, username, role: 'player' };
-    return json(res, { token, uid, email, username, balance: bonus });
-  }
-
-  // ── AUTH: login with email ──
-  if (method === 'POST' && url === '/api/auth/login') {
-    const body = await readBody(req);
-    const { email, password } = body;
-    const users = readDB('users');
-    const u = users.list[email];
-    if (!u || u.pwHash !== hash(password))
-      return json(res, { error: 'Invalid email or password' }, 401);
-    if (u.banned)
-      return json(res, { error: 'Account banned' }, 403);
-    u.lastLogin = new Date().toISOString();
-    writeDB('users', users);
-    const token = genToken();
-    sessions[token] = { uid: u.uid, email, username: u.username, role: 'player' };
-    return json(res, { token, uid: u.uid, email, username: u.username, balance: u.balance });
-  }
-
-  // ── AUTH: Google OAuth simulation ──
-  if (method === 'POST' && url === '/api/auth/google') {
-    // In production: verify the Google ID token server-side
-    // Here we accept the payload from client (demo only)
-    const body = await readBody(req);
-    const { googleToken, refCode } = body; // googleToken would be verified with Google
-    const users = readDB('users');
-    // Simulate extracting user from Google token
-    const uid = 'G' + Date.now();
-    const names = ['Alex','Jordan','Sam','Chris','Morgan','Taylor'];
-    const name  = names[Math.floor(Math.random() * names.length)];
-    const email = name.toLowerCase() + uid.slice(-4) + '@gmail.com';
-    let bonus = 0;
-    const refs = readDB('refs');
-    if (refCode && refs.list[refCode]) bonus = 15;
-    if (!users.list[email]) {
-      const now = new Date().toISOString();
-      users.list[email] = {
-        uid, email, username: name, method: 'google',
-        balance: bonus, gamesPlayed: 0, totalDeposits: 0,
-        registeredAt: now, lastLogin: now, banned: false, referredBy: refCode || null
-      };
-      writeDB('users', users);
-      const myCode = ('OXE' + uid).toUpperCase().slice(0, 8);
-      refs.list[myCode] = { uid, count: 0, earned: 0, referrals: [] };
-      if (refCode && refs.list[refCode]) {
-        const r = refs.list[refCode];
-        if (!r.referrals.includes(uid)) {
-          r.count++; r.earned += 15; r.referrals.push(uid);
-          const referrer = Object.values(users.list).find(u => u.uid === r.uid);
-          if (referrer) referrer.balance = (referrer.balance || 0) + 15;
-          writeDB('users', users);
-        }
-      }
-      writeDB('refs', refs);
-    } else {
-      users.list[email].lastLogin = new Date().toISOString();
-      writeDB('users', users);
-    }
-    const u = users.list[email];
-    const token = genToken();
-    sessions[token] = { uid: u.uid, email, username: u.username, role: 'player' };
-    return json(res, { token, uid: u.uid, email, username: u.username, balance: u.balance });
-  }
-
-  // ── PLAYER: get profile + balance ──
-  if (method === 'GET' && url === '/api/me') {
-    const sess = authCheck(req);
-    if (!sess) return json(res, { error: 'Unauthorized' }, 401);
-    const users = readDB('users');
-    const u = Object.values(users.list).find(u => u.uid === sess.uid);
-    if (!u) return json(res, { error: 'User not found' }, 404);
-    return json(res, { uid: u.uid, email: u.email, username: u.username,
-      balance: u.balance, gamesPlayed: u.gamesPlayed, method: u.method });
-  }
-
-  // ── PLAYER: update balance after game ──
-  if (method === 'POST' && url === '/api/me/balance') {
-    const sess = authCheck(req);
-    if (!sess) return json(res, { error: 'Unauthorized' }, 401);
-    const body = await readBody(req);
-    const users = readDB('users');
-    const u = Object.values(users.list).find(u => u.uid === sess.uid);
-    if (!u) return json(res, { error: 'Not found' }, 404);
-    if (typeof body.balance === 'number') u.balance = Math.max(0, body.balance);
-    if (body.addGame) u.gamesPlayed = (u.gamesPlayed || 0) + 1;
-    writeDB('users', users);
-    return json(res, { balance: u.balance });
-  }
-
-  // ── PLAYER: get referral data ──
-  if (method === 'GET' && url === '/api/referral') {
-    const sess = authCheck(req);
-    if (!sess) return json(res, { error: 'Unauthorized' }, 401);
-    const refs = readDB('refs');
-    const myCode = ('OXE' + sess.uid).toUpperCase().slice(0, 8);
-    const data = refs.list[myCode] || { uid: sess.uid, count: 0, earned: 0, referrals: [] };
-    const baseUrl = req.headers.host ? 'https://' + req.headers.host : 'http://localhost:' + PORT;
-    return json(res, { code: myCode, ...data, url: baseUrl + '/?ref=' + myCode });
-  }
-
-  // ── PLAYER: request withdrawal ──
-  if (method === 'POST' && url === '/api/withdraw') {
-    const sess = authCheck(req);
-    if (!sess) return json(res, { error: 'Unauthorized' }, 401);
-    const body = await readBody(req);
-    const { address, oxeAmount } = body;
-    const users = readDB('users');
-    const u = Object.values(users.list).find(u => u.uid === sess.uid);
-    if (!u) return json(res, { error: 'User not found' }, 404);
-    const cfg = readDB('config');
-    const fee = 20;
-    if (!address || oxeAmount < 200) return json(res, { error: 'Min 200 OXE' }, 400);
-    if (u.balance < oxeAmount + fee) return json(res, { error: 'Insufficient balance' }, 400);
-    u.balance -= (oxeAmount + fee);
-    writeDB('users', users);
-    const txlog = readDB('txlog');
-    const wd = {
-      id: 'WD-' + Date.now(), uid: u.uid, username: u.username,
-      email: u.email, address, oxe: oxeAmount,
-      usdt: (oxeAmount / cfg.rate).toFixed(2),
-      status: 'Pending', note: '', time: new Date().toISOString()
-    };
-    txlog.withdrawals.unshift(wd);
-    writeDB('txlog', txlog);
-    return json(res, { success: true, id: wd.id, newBalance: u.balance });
-  }
-
-  // ── PLAYER: verify deposit tx hash ──
-  if (method === 'POST' && url === '/api/deposit/verify') {
-    const sess = authCheck(req);
-    if (!sess) return json(res, { error: 'Unauthorized' }, 401);
-    const body = await readBody(req);
-    const { txHash } = body;
-    if (!txHash || txHash.length < 60) return json(res, { error: 'Invalid TX hash' }, 400);
-    // TODO: replace with real BSCScan API verification
-    // const bscRes = await fetch(`https://api.bscscan.com/api?module=transaction&action=gettxreceiptstatus&txhash=${txHash}&apikey=YOUR_KEY`)
-    const cfg = readDB('config');
-    const usdtAmt = +(Math.random() * 195 + 5).toFixed(2);
-    const oxeAmt = Math.round(usdtAmt * cfg.rate);
-    const users = readDB('users');
-    const u = Object.values(users.list).find(u => u.uid === sess.uid);
-    if (!u) return json(res, { error: 'User not found' }, 404);
-    u.balance = (u.balance || 0) + oxeAmt;
-    u.totalDeposits = (u.totalDeposits || 0) + usdtAmt;
-    writeDB('users', users);
-    const txlog = readDB('txlog');
-    txlog.deposits.unshift({
-      id: 'DEP-' + Date.now(), uid: u.uid, email: u.email,
-      txHash, usdt: usdtAmt, oxe: oxeAmt,
-      status: 'Confirmed', time: new Date().toISOString()
+    const cfg = db.read('config') || {};
+    return json(res, {
+      rate:           cfg.rate     || 20,
+      minBet:         cfg.minBet   || 10,
+      maxBet:         cfg.maxBet   || 100000,
+      winPct:         cfg.winPct   || 10,
+      trialOxe:       cfg.trialOxe || 200,
+      googleClientId: process.env.GOOGLE_CLIENT_ID || ''
     });
-    writeDB('txlog', txlog);
-    return json(res, { success: true, oxeAmt, usdtAmt, newBalance: u.balance });
   }
 
-  // ────────────────────────────────────────────────────────────────────────────
-  //  ADMIN ROUTES  (require admin token)
-  // ────────────────────────────────────────────────────────────────────────────
+  // ═══════════════════════════════════════════════════════════════════════════
+  //  AUTH — EMAIL
+  // ═══════════════════════════════════════════════════════════════════════════
 
-  // ── ADMIN: login ──
+  // POST /api/auth/send-code — validate fields, store pending, email the code
+  if (method === 'POST' && url === '/api/auth/send-code') {
+    const b = await readBody(req);
+
+    if (!Auth.validEmail(b.email))
+      return json(res, { error: 'Invalid email address.' }, 400);
+    if (!Auth.validUsername(b.username))
+      return json(res, { error: 'Username must be 3–30 characters.' }, 400);
+    if (!Auth.validPassword(b.password))
+      return json(res, { error: 'Password must be at least 6 characters.' }, 400);
+    if (getUserByEmail(b.email))
+      return json(res, { error: 'That email is already registered.' }, 409);
+
+    const code = Email.generateCode();
+    Email.storePending(b.email, code, {
+      username: b.username.trim(),
+      pwHash:   Auth.hashPassword(b.password),
+      refCode:  b.refCode || null
+    });
+
+    const result = await Email.sendEmail(
+      b.email,
+      'Your OXE BALL verification code: ' + code,
+      Email.codeEmailHtml(b.username.trim(), code)
+    );
+
+    if (result.dev) return json(res, { success: true, devCode: code, dev: true });
+    if (!result.ok) return json(res, { error: 'Failed to send email. Check your email config.' }, 500);
+    return json(res, { success: true });
+  }
+
+  // POST /api/auth/verify-code — confirm the code, create account, return JWT
+  if (method === 'POST' && url === '/api/auth/verify-code') {
+    const b      = await readBody(req);
+    const result = Email.checkCode(b.email, b.code);
+
+    if (!result.ok) return json(res, { error: result.error }, 400);
+    if (getUserByEmail(b.email)) {
+      Email.deletePending(b.email);
+      return json(res, { error: 'Email already registered.' }, 409);
+    }
+
+    const { username, pwHash, refCode } = result.data;
+    const user = createUser({ email: b.email, username, pwHash, method: 'email', refCode });
+    user.emailVerified = true;
+    saveUser(user);
+    Email.deletePending(b.email);
+
+    return json(res, { ...loginResponse(user), isNew: true });
+  }
+
+  // POST /api/auth/resend-code — send a fresh code to the same pending registration
+  if (method === 'POST' && url === '/api/auth/resend-code') {
+    const b = await readBody(req);
+    const p = Email.getPending(b.email);
+    if (!p) return json(res, { error: 'No pending registration. Please start over.' }, 400);
+
+    const newCode = Email.generateCode();
+    Email.storePending(b.email, newCode, p.data);
+
+    const result = await Email.sendEmail(
+      b.email,
+      'OXE BALL — new verification code: ' + newCode,
+      Email.codeEmailHtml(p.data.username, newCode)
+    );
+    if (result.dev) return json(res, { success: true, devCode: newCode, dev: true });
+    return json(res, { success: true });
+  }
+
+  // POST /api/auth/login — email + password
+  if (method === 'POST' && url === '/api/auth/login') {
+    const b    = await readBody(req);
+    const user = getUserByEmail(b.email);
+
+    if (!user || !Auth.verifyPassword(b.password, user.pwHash || ''))
+      return json(res, { error: 'Wrong email or password.' }, 401);
+    if (user.banned)
+      return json(res, { error: 'This account is banned.' }, 403);
+
+    user.lastLogin = new Date().toISOString();
+    saveUser(user);
+    return json(res, loginResponse(user));
+  }
+
+  // POST /api/auth/forgot-password — send password reset link
+  if (method === 'POST' && url === '/api/auth/forgot-password') {
+    const b    = await readBody(req);
+    const user = getUserByEmail(b.email);
+
+    // Always return success — don't reveal whether email exists
+    if (!user) return json(res, { success: true });
+
+    const tok  = crypto.randomBytes(32).toString('hex');
+    resetTokens[tok] = { email: b.email.toLowerCase(), exp: Date.now() + 30 * 60_000 };
+
+    const base = process.env.APP_URL || ('http://localhost:' + PORT);
+    const link = base + '/reset-password.html?token=' + tok;
+    const html = '<div style="font-family:sans-serif;padding:24px;background:#07070f">'
+      + '<h2 style="color:#00d4ff;letter-spacing:3px">OXE&#9679;BALL</h2>'
+      + '<p style="color:#aaa">Password reset link (expires in 30 minutes):</p>'
+      + '<a href="' + link + '" style="color:#ff6a00;word-break:break-all">' + link + '</a>'
+      + '<p style="color:#555;margin-top:20px;font-size:12px">Ignore this if you didn\'t request it.</p>'
+      + '</div>';
+
+    await Email.sendEmail(b.email, 'OXE BALL — Password Reset', html);
+    console.log('🔑 Reset link for ' + b.email + ': ' + link);
+    return json(res, { success: true });
+  }
+
+  // POST /api/auth/reset-password — consume reset token, update password
+  if (method === 'POST' && url === '/api/auth/reset-password') {
+    const b = await readBody(req);
+
+    if (!b.token || !Auth.validPassword(b.newPassword))
+      return json(res, { error: 'Missing token or password too short (6+ chars).' }, 400);
+
+    const entry = resetTokens[b.token];
+    if (!entry || Date.now() > entry.exp) {
+      delete resetTokens[b.token];
+      return json(res, { error: 'Reset link has expired or is invalid. Request a new one.' }, 400);
+    }
+
+    const user = getUserByEmail(entry.email);
+    if (!user) return json(res, { error: 'User not found.' }, 404);
+
+    user.pwHash = Auth.hashPassword(b.newPassword);
+    saveUser(user);
+    delete resetTokens[b.token];
+    return json(res, { success: true, message: 'Password updated. You can now sign in.' });
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  //  AUTH — GOOGLE
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  // POST /api/auth/google — verify Google ID token, login or create account
+  if (method === 'POST' && url === '/api/auth/google') {
+    const b = await readBody(req);
+    const { ok, payload, error } = await Google.verifyGoogleToken(b.credential);
+    if (!ok) return json(res, { error }, 401);
+
+    const { email, name, googleId } = payload;
+    let user = getUserByEmail(email);
+
+    if (!user) {
+      // New Google user → create account
+      user = createUser({ email, username: name, method: 'google', googleId, refCode: b.refCode || null });
+      user.emailVerified = true;
+      saveUser(user);
+      return json(res, { ...loginResponse(user), isNew: true });
+    }
+
+    // Returning user → update last login
+    if (user.banned) return json(res, { error: 'This account is banned.' }, 403);
+    user.lastLogin = new Date().toISOString();
+    if (!user.googleId) user.googleId = googleId;
+    if (name) user.username = name;
+    saveUser(user);
+    return json(res, loginResponse(user));
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  //  PLAYER — protected (require valid JWT)
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  // GET /api/me — my profile
+  if (method === 'GET' && url === '/api/me') {
+    const sess = getSession(req);
+    if (!sess) return json(res, { error: 'Unauthorized.' }, 401);
+
+    const user = getUserByUid(sess.uid);
+    if (!user)  return json(res, { error: 'User not found.' }, 404);
+
+    return json(res, {
+      uid:          user.uid,
+      email:        user.email,
+      username:     user.username,
+      method:       user.method,
+      balance:      user.balance      || 0,
+      gamesPlayed:  user.gamesPlayed  || 0,
+      referralCode: user.referralCode,
+      emailVerified: user.emailVerified
+    });
+  }
+
+  // POST /api/me/balance — update balance + increment games played
+  if (method === 'POST' && url === '/api/me/balance') {
+    const sess = getSession(req);
+    if (!sess) return json(res, { error: 'Unauthorized.' }, 401);
+
+    const b    = await readBody(req);
+    const user = getUserByUid(sess.uid);
+    if (!user)  return json(res, { error: 'User not found.' }, 404);
+
+    if (typeof b.balance === 'number') user.balance = Math.max(0, b.balance);
+    if (b.addGame) user.gamesPlayed = (user.gamesPlayed || 0) + 1;
+    saveUser(user);
+    return json(res, { balance: user.balance });
+  }
+
+  // GET /api/referral — my referral code and stats
+  if (method === 'GET' && url === '/api/referral') {
+    const sess = getSession(req);
+    if (!sess) return json(res, { error: 'Unauthorized.' }, 401);
+    const host = req.headers.host || ('localhost:' + PORT);
+    return json(res, Referral.getReferralData(sess.uid, host));
+  }
+
+  // POST /api/withdraw — request a USDT withdrawal
+  if (method === 'POST' && url === '/api/withdraw') {
+    const sess = getSession(req);
+    if (!sess) return json(res, { error: 'Unauthorized.' }, 401);
+
+    const b = await readBody(req);
+    if (!b.address || !b.oxeAmount || b.oxeAmount < 200)
+      return json(res, { error: 'Minimum withdrawal is 200 OXE.' }, 400);
+
+    const user = getUserByUid(sess.uid);
+    if (!user)  return json(res, { error: 'User not found.' }, 404);
+
+    const FEE   = 20;
+    const total = b.oxeAmount + FEE;
+    if ((user.balance || 0) < total)
+      return json(res, { error: 'Insufficient balance. Need ' + total + ' OXE (includes ' + FEE + ' fee).' }, 400);
+
+    user.balance -= total;
+    saveUser(user);
+
+    const cfg   = db.read('config') || {};
+    const txlog = db.read('txlog')  || { deposits: [], withdrawals: [], deletedUsers: [] };
+    txlog.withdrawals.unshift({
+      id:       'WD-' + Date.now(),
+      uid:      user.uid,
+      email:    user.email,
+      username: user.username,
+      address:  b.address,
+      oxe:      b.oxeAmount,
+      usdt:     (b.oxeAmount / (cfg.rate || 20)).toFixed(2),
+      status:   'Pending',
+      note:     '',
+      time:     new Date().toISOString()
+    });
+    db.write('txlog', txlog);
+    return json(res, { success: true, newBalance: user.balance });
+  }
+
+  // POST /api/deposit/verify — verify USDT deposit by TX hash
+  if (method === 'POST' && url === '/api/deposit/verify') {
+    const sess = getSession(req);
+    if (!sess) return json(res, { error: 'Unauthorized.' }, 401);
+
+    const b = await readBody(req);
+    if (!b.txHash || b.txHash.length < 60)
+      return json(res, { error: 'Invalid transaction hash.' }, 400);
+
+    // TODO: replace simulation with real BSCScan API call in production
+    const cfg     = db.read('config') || {};
+    const usdtAmt = +(5 + Math.random() * 195).toFixed(2);
+    const oxeAmt  = Math.round(usdtAmt * (cfg.rate || 20));
+
+    const user = getUserByUid(sess.uid);
+    if (!user)  return json(res, { error: 'User not found.' }, 404);
+
+    user.balance       = (user.balance       || 0) + oxeAmt;
+    user.totalDeposits = (user.totalDeposits || 0) + usdtAmt;
+    saveUser(user);
+
+    const txlog = db.read('txlog') || { deposits: [], withdrawals: [] };
+    txlog.deposits.unshift({
+      id:     'DEP-' + Date.now(),
+      uid:    user.uid,
+      email:  user.email,
+      txHash: b.txHash,
+      usdt:   usdtAmt,
+      oxe:    oxeAmt,
+      status: 'Confirmed',
+      time:   new Date().toISOString()
+    });
+    db.write('txlog', txlog);
+    return json(res, { success: true, oxeAmt, usdtAmt, newBalance: user.balance });
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  //  ADMIN
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  // POST /api/admin/login — authenticate admin (uses ADMIN_PASSWORD env var)
   if (method === 'POST' && url === '/api/admin/login') {
-    const body = await readBody(req);
-    const cfg  = readDB('config');
-    if (body.password !== cfg.adminPw)
-      return json(res, { error: 'Wrong password' }, 401);
-    const token = genToken();
-    sessions[token] = { role: 'admin', uid: 'ADMIN' };
+    const b = await readBody(req);
+    if (b.password !== ADMIN_PW) return json(res, { error: 'Wrong password.' }, 401);
+    const token = Auth.signJWT({ uid: 'ADMIN', role: 'admin', username: 'Admin' });
     return json(res, { token });
   }
 
-  // Check admin auth for all /api/admin/* routes below
-  if (url.startsWith('/api/admin/') && !isAdmin(req))
-    return json(res, { error: 'Unauthorized' }, 401);
+  // Guard: all /api/admin/* routes below require admin JWT
+  if (url.startsWith('/api/admin')) {
+    const sess = getSession(req);
+    if (!sess || sess.role !== 'admin')
+      return json(res, { error: 'Unauthorized.' }, 401);
+  }
 
-  // ── ADMIN: get all users ──
   if (method === 'GET' && url === '/api/admin/users') {
-    return json(res, readDB('users').list);
+    return json(res, Object.values(getUsers().byEmail));
   }
 
-  // ── ADMIN: ban/unban user ──
-  if (method === 'POST' && url === '/api/admin/users/ban') {
-    const body = await readBody(req);
-    const users = readDB('users');
-    const u = Object.values(users.list).find(u => u.uid === body.uid);
-    if (!u) return json(res, { error: 'Not found' }, 404);
-    u.banned = body.ban;
-    if (body.ban) u.bannedAt = new Date().toISOString();
-    else delete u.bannedAt;
-    writeDB('users', users);
-    return json(res, { success: true });
-  }
-
-  // ── ADMIN: delete user ──
-  if (method === 'DELETE' && url.startsWith('/api/admin/users/')) {
-    const uid = url.split('/').pop();
-    const users = readDB('users');
-    let deleted = null;
-    for (const [email, u] of Object.entries(users.list)) {
-      if (u.uid === uid) { deleted = u; delete users.list[email]; break; }
-    }
-    if (!deleted) return json(res, { error: 'Not found' }, 404);
-    writeDB('users', users);
-    // Remove referral code
-    const refs = readDB('refs');
-    for (const [code, r] of Object.entries(refs.list)) {
-      if (r.uid === uid) { delete refs.list[code]; break; }
-    }
-    writeDB('refs', refs);
-    // Log
-    const txlog = readDB('txlog');
-    txlog.deletedUsers = txlog.deletedUsers || [];
-    txlog.deletedUsers.push({ uid, name: deleted.username || deleted.email,
-      deletedAt: new Date().toISOString() });
-    writeDB('txlog', txlog);
-    // Invalidate session
-    for (const [t, s] of Object.entries(sessions)) {
-      if (s.uid === uid) delete sessions[t];
-    }
-    return json(res, { success: true });
-  }
-
-  // ── ADMIN: get config ──
   if (method === 'GET' && url === '/api/admin/config') {
-    return json(res, readDB('config'));
+    return json(res, db.read('config') || {});
   }
 
-  // ── ADMIN: save config ──
   if (method === 'POST' && url === '/api/admin/config') {
-    const body = await readBody(req);
-    const cfg  = readDB('config');
-    Object.assign(cfg, body);
-    writeDB('config', cfg);
+    const b   = await readBody(req);
+    const cfg = db.read('config') || {};
+    Object.assign(cfg, b);
+    db.write('config', cfg);
     return json(res, { success: true });
   }
 
-  // ── ADMIN: get withdrawals ──
-  if (method === 'GET' && url === '/api/admin/withdrawals') {
-    return json(res, readDB('txlog').withdrawals || []);
+  if (method === 'POST' && url === '/api/admin/users/ban') {
+    const b     = await readBody(req);
+    const users = getUsers();
+    const user  = Object.values(users.byEmail).find(u => u.uid === b.uid);
+    if (!user) return json(res, { error: 'User not found.' }, 404);
+    user.banned = b.ban;
+    if (b.ban) user.bannedAt = new Date().toISOString(); else delete user.bannedAt;
+    db.write('users', users);
+    return json(res, { success: true });
   }
 
-  // ── ADMIN: update withdrawal status ──
+  if (method === 'DELETE' && url.startsWith('/api/admin/users/')) {
+    const uid   = decodeURIComponent(url.split('/').pop());
+    const users = getUsers();
+    let deleted = null;
+    for (const [k, v] of Object.entries(users.byEmail)) {
+      if (v.uid === uid) { deleted = v; delete users.byEmail[k]; break; }
+    }
+    if (!deleted) return json(res, { error: 'User not found.' }, 404);
+    db.write('users', users);
+    const txlog = db.read('txlog') || {};
+    (txlog.deletedUsers = txlog.deletedUsers || []).push({
+      uid, name: deleted.username || deleted.email, deletedAt: new Date().toISOString()
+    });
+    db.write('txlog', txlog);
+    return json(res, { success: true });
+  }
+
+  if (method === 'GET' && url === '/api/admin/withdrawals')
+    return json(res, (db.read('txlog') || {}).withdrawals || []);
+
   if (method === 'POST' && url === '/api/admin/withdrawals/update') {
-    const body  = await readBody(req);
-    const txlog = readDB('txlog');
-    const wd = txlog.withdrawals.find(w => w.id === body.id);
-    if (!wd) return json(res, { error: 'Not found' }, 404);
-    wd.status = body.status;
-    wd.note   = body.note || wd.note;
-    writeDB('txlog', txlog);
+    const b     = await readBody(req);
+    const txlog = db.read('txlog') || { withdrawals: [] };
+    const wd    = txlog.withdrawals.find(w => w.id === b.id);
+    if (!wd) return json(res, { error: 'Withdrawal not found.' }, 404);
+    wd.status = b.status;
+    wd.note   = b.note || wd.note || '';
+    db.write('txlog', txlog);
     return json(res, { success: true });
   }
 
-  // ── ADMIN: get deposits ──
-  if (method === 'GET' && url === '/api/admin/deposits') {
-    return json(res, readDB('txlog').deposits || []);
-  }
+  if (method === 'GET' && url === '/api/admin/deposits')
+    return json(res, (db.read('txlog') || {}).deposits || []);
 
-  // ── ADMIN: get referrals ──
-  if (method === 'GET' && url === '/api/admin/referrals') {
-    return json(res, readDB('refs').list);
-  }
+  if (method === 'GET' && url === '/api/admin/referrals')
+    return json(res, (db.read('refs') || { codes: {} }).codes);
 
-  // ── ADMIN: get deleted users ──
-  if (method === 'GET' && url === '/api/admin/deleted') {
-    return json(res, (readDB('txlog').deletedUsers || []));
-  }
+  if (method === 'GET' && url === '/api/admin/deleted')
+    return json(res, (db.read('txlog') || {}).deletedUsers || []);
 
-  // 404
-  json(res, { error: 'Not found' }, 404);
+  // 404 fallback
+  return json(res, { error: 'Not found.' }, 404);
 
 }).listen(PORT, HOST, () => {
-  console.log('\n╔══════════════════════════════════════════╗');
-  console.log('║   OXE BALL SERVER RUNNING                ║');
-  console.log(`║   http://localhost:${PORT}                 ║`);
-  console.log(`║   Game:  http://localhost:${PORT}/         ║`);
-  console.log(`║   Admin: http://localhost:${PORT}/admin    ║`);
-  console.log('╚══════════════════════════════════════════╝\n');
-  console.log('  Share the public URL from your host.');
-  console.log('  Railway: check Deployments > Domain tab\n');
+  const sep = '═'.repeat(50);
+  console.log('\n╔' + sep + '╗');
+  console.log('║  ⬡  OXE BALL  ·  Production Server                ║');
+  console.log('║                                                    ║');
+  console.log('║  Game:   http://localhost:' + PORT + '/                  ║');
+  console.log('║  Admin:  http://localhost:' + PORT + '/admin             ║');
+  console.log('║  Health: http://localhost:' + PORT + '/health            ║');
+  console.log('╚' + sep + '╝\n');
+
+  if (!process.env.JWT_SECRET)
+    console.warn('  ⚠  JWT_SECRET not set — set it in Railway Variables');
+  if (!process.env.ADMIN_PASSWORD)
+    console.warn('  ⚠  ADMIN_PASSWORD not set — default "oxeball2024" is active');
+  if (!process.env.GOOGLE_CLIENT_ID)
+    console.warn('  ⚠  GOOGLE_CLIENT_ID not set — Google login is disabled');
+  if (!process.env.RESEND_API_KEY && !process.env.SMTP_USER)
+    console.warn('  ⚠  No email config — DEV MODE active (codes shown in console)');
+  console.log('');
 });
